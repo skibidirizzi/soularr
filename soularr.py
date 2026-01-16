@@ -940,7 +940,20 @@ try:
         search_sources = ['missing', 'cutoff_unmet']
 
     minimum_match_ratio = config.getfloat('Search Settings', 'minimum_filename_match_ratio', fallback=0.5)
+    # Existing setting (still used as fallback)
     page_size = config.getint('Search Settings', 'number_of_albums_to_grab', fallback=10)
+
+# Batch settings
+    batch_enabled = config.getboolean('Batch', 'enabled', fallback=False)
+    batch_size = config.getint('Batch', 'batch_size', fallback=page_size)
+    sleep_between_batches_seconds = config.getint('Batch', 'sleep_between_batches_seconds', fallback=15)
+    max_batches = config.getint('Batch', 'max_batches', fallback=0)  # 0 = infinite
+    exit_when_no_wanted = config.getboolean('Batch', 'exit_when_no_wanted', fallback=True)
+
+# If batching is enabled, drive page_size from batch_size so get_records() naturally returns N items
+    if batch_enabled:
+        page_size = batch_size
+
     remove_wanted_on_failure = config.getboolean('Search Settings', 'remove_wanted_on_failure', fallback=True)
     enable_search_denylist = config.getboolean('Search Settings', 'enable_search_denylist', fallback=False)
     max_search_failures = config.getint('Search Settings', 'max_search_failures', fallback=3)
@@ -976,27 +989,66 @@ try:
         logger.error('Exiting...')
         sys.exit(0)
 
-    if len(wanted_records) > 0:
+    batch_num = 0
+
+    while True:
+        # Respect max_batches (0 = run forever)
+        if max_batches > 0 and batch_num >= max_batches:
+            logger.info(f"Reached max_batches={max_batches}. Exiting...")
+            break
+
+        wanted_records = []
+        try:
+            for source in search_sources:
+                logging.debug(f'Getting records from {source}')
+                missing = source == 'missing'
+                wanted_records.extend(get_records(missing))
+        except ValueError as ex:
+            logger.error(f'An error occurred: {ex}')
+            logger.error('Exiting...')
+            break
+
+        if len(wanted_records) == 0:
+            logger.info("No releases wanted.")
+            if exit_when_no_wanted:
+                logger.info("exit_when_no_wanted=True, exiting...")
+                break
+
+            # Poll mode: keep checking again later
+            logger.info(f"Sleeping {sleep_between_batches_seconds}s before polling again...")
+            time.sleep(sleep_between_batches_seconds)
+            continue
+
+        batch_num += 1
+        logger.info(f"=== Batch {batch_num} starting (up to {page_size} releases) ===")
+
         try:
             failed = grab_most_wanted(wanted_records)
         except Exception:
             logger.error(traceback.format_exc())
-            logger.error("\n Fatal error! Exiting...")
+            logger.error("Batch crashed. Skipping this batch and continuing to next...")
+            logger.info(f"Sleeping {sleep_between_batches_seconds}s before next batch...")
+            time.sleep(sleep_between_batches_seconds)
+            continue
 
-            if os.path.exists(lock_file_path) and not is_docker():
-                os.remove(lock_file_path)
-            sys.exit(0)
-        if failed == 0:
-            logger.info("Soularr finished. Exiting...")
+
+        # Clean up completed downloads each batch (same as your current behavior)
+        try:
             slskd.transfers.remove_completed_downloads()
+        except Exception:
+            logger.warning("Unable to remove completed downloads from slskd (non-fatal).")
+
+        if failed == 0:
+            logger.info(f"=== Batch {batch_num} complete: all releases processed successfully ===")
         else:
             if remove_wanted_on_failure:
-                logger.info(f'{failed}: releases failed to find a match in the search results. View "failure_list.txt" for list of failed albums.')
+                logger.info(f"=== Batch {batch_num} complete: {failed} releases failed and were removed from wanted ===")
             else:
-                logger.info(f"{failed}: releases failed to find a match in the search results and are still wanted.")
-            slskd.transfers.remove_completed_downloads()
-    else:
-        logger.info("No releases wanted. Exiting...")
+                logger.info(f"=== Batch {batch_num} complete: {failed} releases failed and are still wanted ===")
+
+        logger.info(f"Sleeping {sleep_between_batches_seconds}s before next batch...")
+        time.sleep(sleep_between_batches_seconds)
+
 
 finally:
     # Remove the lock file after activity is done
